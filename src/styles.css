@@ -157,5 +157,23 @@
   body {
     background-color: var(--color-background);
     color: var(--color-foreground);
+    background-image:
+      radial-gradient(ellipse at top, color-mix(in oklab, var(--status-live) 6%, transparent) 0%, transparent 55%),
+      repeating-linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent 2px,
+        oklch(1 0 0 / 1.5%) 3px,
+        transparent 4px
+      );
+    background-attachment: fixed;
   }
 }
+
+mark.hl {
+  background-color: color-mix(in oklab, var(--status-live) 30%, transparent);
+  color: var(--foreground);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
