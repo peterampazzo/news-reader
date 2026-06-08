@@ -177,3 +177,32 @@ mark.hl {
   padding: 0 2px;
 }
 
+/* Scrollable grid with a fade-out mask at the bottom */
+.fade-mask {
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 28px), transparent 100%);
+          mask-image: linear-gradient(to bottom, black calc(100% - 28px), transparent 100%);
+}
+
+.thin-scroll::-webkit-scrollbar { width: 6px; }
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--foreground) 14%, transparent);
+  border-radius: 3px;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklab, var(--foreground) 6%, transparent) 0%,
+    color-mix(in oklab, var(--foreground) 12%, transparent) 50%,
+    color-mix(in oklab, var(--foreground) 6%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+  border-radius: 3px;
+}
+
+
