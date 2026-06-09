@@ -1,0 +1,25 @@
+{
+  "name": "Real-time Chronicle",
+  "short_name": "Chronicle",
+  "description": "Real-time terminal-style news stream aggregating multiple sources into one chronological feed.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0e1a",
+  "theme_color": "#0a0e1a",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

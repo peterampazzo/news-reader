@@ -5,7 +5,7 @@ import {
 } from "lucide-react";
 import {
   SOURCE_CATALOG, DEFAULT_ENABLED, CATEGORY_META, CATEGORY_ORDER,
-  buildCatalog, getSource, type SourceConfig, type SourceCategory,
+  buildCatalog, getSource, feednamiApi, type SourceConfig, type SourceCategory,
   type CustomSource,
 } from "@/lib/news-sources";
 import { useLocalStorage } from "@/hooks/use-local-storage";
@@ -29,9 +29,13 @@ interface FeedStatus {
   error?: string;
   lastTried: number;
   lastSuccess?: number;
+  backoffUntil?: number; // ms epoch — skip refreshes until this time
+  consecutiveFailures?: number;
 }
 
-const USER_LANG = "en"; // target translation language
+const USER_LANG = "en";
+const POLL_INTERVAL_MS = 45_000;
+const BACKOFF_MS = 90_000;
 
 function stripHtml(html: string): string {
   if (!html) return "";
@@ -42,54 +46,91 @@ function relativeTime(ts: number, now: number): string {
   const diff = Math.max(0, Math.floor((now - ts) / 1000));
   if (diff < 60) return `${diff}s ago`;
   const mins = Math.floor(diff / 60);
-  if (mins < 60) return `${mins} min${mins === 1 ? "" : "s"} ago`;
+  if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs} hr${hrs === 1 ? "" : "s"} ago`;
+  if (hrs < 24) return `${hrs}h ago`;
   const days = Math.floor(hrs / 24);
-  return `${days} day${days === 1 ? "" : "s"} ago`;
+  return `${days}d ago`;
 }
 
 function extractThumbnail(item: any): string | undefined {
   if (item.thumbnail && typeof item.thumbnail === "string" && item.thumbnail.startsWith("http")) return item.thumbnail;
   if (item.enclosure?.link) return item.enclosure.link;
-  const html = (item.content || item.description || "") as string;
+  if (item.enclosures && item.enclosures[0]?.url) return item.enclosures[0].url;
+  if (item.image) return typeof item.image === "string" ? item.image : item.image.url;
+  const html = (item.content || item.description || item.summary || "") as string;
   const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
   return m?.[1];
 }
 
 function proxyImage(url: string): string {
-  // weserv.nl: protocol-less URL, http/https supported, mitigates mixed content + some CORS
   const stripped = url.replace(/^https?:\/\//, "");
   return `https://images.weserv.nl/?url=${encodeURIComponent(stripped)}&w=160&h=160&fit=cover&output=webp`;
 }
 
+function parseDate(s: string | undefined): number {
+  if (!s) return Date.now();
+  const t = new Date(s).getTime();
+  if (Number.isFinite(t)) return t;
+  const t2 = new Date(s.replace(" ", "T") + "Z").getTime();
+  return Number.isFinite(t2) ? t2 : Date.now();
+}
+
+function mapRss2Json(json: any, src: SourceConfig): Article[] {
+  if (!Array.isArray(json?.items)) throw new Error("Bad payload");
+  return json.items.slice(0, 25).map((item: any, idx: number): Article => ({
+    id: `${src.key}-${item.guid || item.link || idx}`,
+    sourceKey: src.key,
+    title: stripHtml(item.title || "Untitled"),
+    snippet: stripHtml(item.description || item.content || "").slice(0, 220),
+    link: item.link || "#",
+    pubDate: parseDate(item.pubDate),
+    thumbnail: extractThumbnail(item),
+    lang: src.lang,
+  }));
+}
+
+function mapFeednami(json: any, src: SourceConfig): Article[] {
+  const entries = json?.feed?.entries;
+  if (!Array.isArray(entries)) throw new Error("Bad fallback payload");
+  return entries.slice(0, 25).map((item: any, idx: number): Article => ({
+    id: `${src.key}-${item.guid || item.url || idx}`,
+    sourceKey: src.key,
+    title: stripHtml(item.title || "Untitled"),
+    snippet: stripHtml(item.description || item.contentSnippet || item.content || "").slice(0, 220),
+    link: item.url || item.link || "#",
+    pubDate: parseDate(item.published || item.pubDate),
+    thumbnail: extractThumbnail(item),
+    lang: src.lang,
+  }));
+}
+
 async function fetchSource(src: SourceConfig): Promise<{ articles: Article[]; status: FeedStatus }> {
   const tried = Date.now();
+  // Primary: rss2json
   try {
     const res = await fetch(src.feedUrl, { cache: "no-store" });
+    if (res.status === 429 || res.status === 433) throw new Error(`HTTP ${res.status}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (json.status && json.status !== "ok") throw new Error(json.message || "Feed error");
-    if (!Array.isArray(json?.items)) throw new Error("Bad payload");
-    const articles = json.items.slice(0, 25).map((item: any, idx: number): Article => {
-      const raw = item.pubDate ? new Date(item.pubDate.replace(" ", "T") + "Z").getTime() : Date.now();
+    const articles = mapRss2Json(json, src);
+    return { articles, status: { ok: true, lastTried: tried, lastSuccess: tried, consecutiveFailures: 0 } };
+  } catch (primaryErr) {
+    // Fallback: feednami
+    try {
+      const res = await fetch(feednamiApi(src.rssUrl), { cache: "no-store" });
+      if (!res.ok) throw new Error(`fallback HTTP ${res.status}`);
+      const json = await res.json();
+      const articles = mapFeednami(json, src);
+      return { articles, status: { ok: true, lastTried: tried, lastSuccess: tried, consecutiveFailures: 0 } };
+    } catch (fallbackErr) {
+      const msg = primaryErr instanceof Error ? primaryErr.message : "Failed";
       return {
-        id: `${src.key}-${item.guid || item.link || idx}`,
-        sourceKey: src.key,
-        title: stripHtml(item.title || "Untitled"),
-        snippet: stripHtml(item.description || item.content || "").slice(0, 220),
-        link: item.link || "#",
-        pubDate: Number.isFinite(raw) ? raw : Date.now(),
-        thumbnail: extractThumbnail(item),
-        lang: src.lang,
+        articles: [],
+        status: { ok: false, error: msg, lastTried: tried },
       };
-    });
-    return { articles, status: { ok: true, lastTried: tried, lastSuccess: tried } };
-  } catch (err) {
-    return {
-      articles: [],
-      status: { ok: false, error: err instanceof Error ? err.message : "Failed", lastTried: tried },
-    };
+    }
   }
 }
 
@@ -118,6 +159,29 @@ function SourceBadge({ src }: { src: SourceConfig }) {
 }
 
 export function NewsStream() {
+  // ---- Hydration gate: client-only render ----
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+  if (!mounted) {
+    return (
+      <div className="min-h-screen text-foreground">
+        <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border">
+          <div className="mx-auto max-w-2xl px-4 sm:px-6 py-3">
+            <div className="h-7 w-40 rounded skeleton-shimmer" />
+          </div>
+        </header>
+        <main className="mx-auto max-w-2xl px-4 sm:px-6 py-6 space-y-3">
+          {[0, 1, 2, 3, 4].map((i) => (
+            <div key={i} className="h-20 rounded-md border border-border bg-card/40 animate-pulse" />
+          ))}
+        </main>
+      </div>
+    );
+  }
+  return <NewsStreamInner />;
+}
+
+function NewsStreamInner() {
   const [customSources, setCustomSources] = useLocalStorage<CustomSource[]>("ns:custom-sources", []);
   const [enabledSources, setEnabledSources] = useLocalStorage<string[]>("ns:enabled-sources", DEFAULT_ENABLED);
   const [activeFilter, setActiveFilter] = useLocalStorage<string>("ns:active-filter", "all");
@@ -132,14 +196,15 @@ export function NewsStream() {
   const [now, setNow] = useState(Date.now());
   const [lastUpdate, setLastUpdate] = useState<number | null>(null);
   const [pendingNew, setPendingNew] = useState(0);
-  // per-article translation state: { [id]: { title, snippet, loading, error, shown } }
+  const [showBackToTop, setShowBackToTop] = useState(false);
   const [translations, setTranslations] = useState<
     Record<string, { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean }>
   >({});
 
   const seenRef = useRef<Set<string>>(new Set());
   const sessionStartRef = useRef<number>(lastVisit);
-  const scrollerRef = useRef<HTMLDivElement>(null);
+  const statusesRef = useRef<Record<string, FeedStatus>>({});
+  statusesRef.current = statuses;
 
   useEffect(() => {
     const save = () => setLastVisit(Date.now());
@@ -149,6 +214,13 @@ export function NewsStream() {
       save();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Back to top scroll listener
+  useEffect(() => {
+    const onScroll = () => setShowBackToTop(window.scrollY > 500);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
   const fullCatalog = useMemo(() => buildCatalog(customSources), [customSources]);
@@ -161,31 +233,48 @@ export function NewsStream() {
     let mounted = true;
 
     const refresh = async (initial: boolean) => {
-      const results = await Promise.all(enabledConfigs.map(fetchSource));
+      const nowTs = Date.now();
+      // Respect per-source backoff (skip sources currently backing off, except on initial load)
+      const toFetch = enabledConfigs.filter((s) => {
+        if (initial) return true;
+        const st = statusesRef.current[s.key];
+        return !st?.backoffUntil || st.backoffUntil < nowTs;
+      });
+      const results = await Promise.all(toFetch.map(fetchSource));
       if (!mounted) return;
 
-      const statusMap: Record<string, FeedStatus> = {};
+      const statusMap: Record<string, FeedStatus> = { ...statusesRef.current };
       const merged: Article[] = [];
+
       results.forEach((r, i) => {
-        const prev = statuses[enabledConfigs[i].key];
-        statusMap[enabledConfigs[i].key] = {
-          ...r.status,
-          lastSuccess: r.status.lastSuccess ?? prev?.lastSuccess,
-        };
-        merged.push(...r.articles);
+        const src = toFetch[i];
+        const prev = statusMap[src.key];
+        if (r.status.ok) {
+          statusMap[src.key] = { ...r.status };
+        } else {
+          const fails = (prev?.consecutiveFailures ?? 0) + 1;
+          statusMap[src.key] = {
+            ...r.status,
+            consecutiveFailures: fails,
+            // back off after 2 consecutive failures
+            backoffUntil: fails >= 2 ? Date.now() + BACKOFF_MS : undefined,
+            lastSuccess: prev?.lastSuccess,
+          };
+        }
       });
 
-      // Token-based dedup: walk newest→oldest, drop near-duplicate titles already kept
+      // collect articles from all enabled (use any successful prev articles too — pull from existing state)
+      results.forEach((r) => merged.push(...r.articles));
+
+      // Token-based dedup
       merged.sort((a, b) => b.pubDate - a.pubDate);
       const kept: Article[] = [];
-      const keptTokens: string[][] = [];
       for (const a of merged) {
-        const toks = tokenize(a.title);
         let dup = false;
-        for (let i = 0; i < keptTokens.length; i++) {
+        for (let i = 0; i < kept.length; i++) {
           if (isNearDuplicate(a.title, kept[i].title)) { dup = true; break; }
         }
-        if (!dup) { kept.push(a); keptTokens.push(toks); }
+        if (!dup) kept.push(a);
       }
 
       setStatuses(statusMap);
@@ -204,7 +293,7 @@ export function NewsStream() {
             combined.sort((a, b) => b.pubDate - a.pubDate);
             return combined.slice(0, 300);
           });
-          if ((scrollerRef.current?.scrollTop ?? window.scrollY) > 400) {
+          if (window.scrollY > 400) {
             setPendingNew((p) => p + incoming.length);
           }
         }
@@ -215,7 +304,7 @@ export function NewsStream() {
     setLoading(true);
     seenRef.current = new Set();
     refresh(true);
-    const poll = setInterval(() => refresh(false), 45_000);
+    const poll = setInterval(() => refresh(false), POLL_INTERVAL_MS);
     const tick = setInterval(() => setNow(Date.now()), 30_000);
 
     return () => {
@@ -265,7 +354,6 @@ export function NewsStream() {
   const handleTranslate = async (a: Article) => {
     const existing = translations[a.id];
     if (existing?.title) {
-      // toggle showing
       setTranslations((p) => ({ ...p, [a.id]: { ...existing, shown: !existing.shown } }));
       return;
     }
@@ -288,10 +376,10 @@ export function NewsStream() {
   return (
     <div className="min-h-screen text-foreground">
       <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border">
-        <div className="mx-auto max-w-2xl px-4 sm:px-6 py-3 space-y-3">
+        <div className="mx-auto max-w-2xl px-3 sm:px-6 py-3 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <span
-              className="inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-mono"
+              className="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-mono"
               style={{
                 borderColor: "color-mix(in oklab, var(--status-live) 45%, transparent)",
                 backgroundColor: "color-mix(in oklab, var(--status-live) 14%, transparent)",
@@ -302,40 +390,44 @@ export function NewsStream() {
                 className="h-1.5 w-1.5 rounded-full animate-pulse-dot"
                 style={{ backgroundColor: "var(--status-live)", boxShadow: "0 0 8px var(--status-live)" }}
               />
-              Active Stream: Listening
+              <span className="hidden xs:inline sm:inline">Live Stream</span>
+              <span className="xs:hidden sm:hidden">LIVE</span>
             </span>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-2">
               <button
                 onClick={() => setDensity(density === "comfortable" ? "compact" : "comfortable")}
-                className="rounded border border-border p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                className="rounded-md border border-border p-2.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors min-w-11 min-h-11 inline-flex items-center justify-center"
                 title={`Density: ${density}`}
+                aria-label="Toggle density"
               >
-                {density === "comfortable" ? <Rows3 className="h-3.5 w-3.5" /> : <Rows4 className="h-3.5 w-3.5" />}
+                {density === "comfortable" ? <Rows3 className="h-4 w-4" /> : <Rows4 className="h-4 w-4" />}
               </button>
               <button
                 onClick={() => setSettingsOpen(true)}
-                className="rounded border border-border p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                className="rounded-md border border-border p-2.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors min-w-11 min-h-11 inline-flex items-center justify-center"
                 title="Sources"
+                aria-label="Open sources settings"
               >
-                <Settings2 className="h-3.5 w-3.5" />
+                <Settings2 className="h-4 w-4" />
               </button>
             </div>
           </div>
 
           <div className="relative">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="grep stream…"
-              className="w-full rounded border border-border bg-muted/40 pl-8 pr-8 py-1.5 text-xs font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:border-ring transition-colors"
+              placeholder="search the stream…"
+              className="w-full rounded-md border border-border bg-muted/40 pl-9 pr-9 py-2.5 text-sm font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:border-ring transition-colors"
             />
             {query && (
               <button
                 onClick={() => setQuery("")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-muted-foreground hover:text-foreground"
+                aria-label="Clear search"
               >
-                <X className="h-3.5 w-3.5" />
+                <X className="h-4 w-4" />
               </button>
             )}
           </div>
@@ -371,7 +463,7 @@ export function NewsStream() {
         <div className="sticky top-[var(--header-h,140px)] z-20 flex justify-center pointer-events-none">
           <button
             onClick={onShowNew}
-            className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-mono shadow-lg animate-stream-in"
+            className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-4 py-2 text-xs font-mono shadow-lg animate-stream-in"
             style={{
               backgroundColor: "color-mix(in oklab, var(--status-live) 22%, var(--background))",
               borderColor: "color-mix(in oklab, var(--status-live) 50%, transparent)",
@@ -384,13 +476,13 @@ export function NewsStream() {
         </div>
       )}
 
-      <main ref={scrollerRef} className="mx-auto max-w-2xl px-4 sm:px-6 py-6">
+      <main className="mx-auto max-w-2xl px-3 sm:px-6 py-4 sm:py-6">
         {loading ? (
           <div className="space-y-3">
             {[0, 1, 2, 3].map((i) => (
               <div
                 key={i}
-                className="h-24 rounded-md border border-border bg-card/40 animate-pulse"
+                className="h-20 rounded-md border border-border bg-card/40 animate-pulse"
                 style={{ animationDelay: `${i * 80}ms` }}
               />
             ))}
@@ -400,7 +492,7 @@ export function NewsStream() {
             no results · adjust filters or query
           </div>
         ) : (
-          <ol className="space-y-2.5">
+          <ol className="space-y-2 sm:space-y-2.5">
             {visible.map((a) => {
               const src = getSource(a.sourceKey, customSources);
               if (!src) return null;
@@ -412,88 +504,21 @@ export function NewsStream() {
               const canTranslate = a.lang && a.lang !== USER_LANG;
               return (
                 <li key={a.id}>
-                  <div
-                    className={[
-                      "group relative block rounded-md border bg-card transition-all hover:bg-accent/40 hover:border-border/80",
-                      density === "compact" ? "px-3 py-2.5" : "px-4 py-3.5",
-                      a.isNew ? "animate-stream-in" : "",
-                      isUnread ? "border-[color-mix(in_oklab,var(--status-live)_30%,var(--border))]" : "border-border",
-                    ].join(" ")}
-                  >
-                    {isUnread && (
-                      <span
-                        className="absolute left-0 top-3 h-[calc(100%-1.5rem)] w-[2px] rounded-r"
-                        style={{ backgroundColor: "var(--status-live)" }}
-                      />
-                    )}
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2">
-                        <SourceBadge src={src} />
-                        {isUnread && (
-                          <span className="text-[9px] font-mono uppercase tracking-wider text-[var(--status-live)]">
-                            ● new
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {canTranslate && (
-                          <button
-                            onClick={(e) => { e.preventDefault(); handleTranslate(a); }}
-                            className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                            title={showTranslated ? "Show original" : `Translate from ${a.lang}`}
-                          >
-                            {tr?.loading ? (
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                            ) : (
-                              <Languages className="h-3 w-3" />
-                            )}
-                            {showTranslated ? "original" : (a.lang ?? "tr").toUpperCase()}
-                          </button>
-                        )}
-                        <time className="text-[10px] font-mono text-muted-foreground tabular-nums">
-                          {relativeTime(a.pubDate, now)}
-                        </time>
-                      </div>
-                    </div>
-                    <a
-                      href={a.link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={density === "compact" ? "mt-1.5 flex gap-3" : "mt-2 flex gap-3"}
-                    >
-                      {density !== "compact" && (
-                        <Thumbnail src={a.thumbnail} alt="" srcColor={src.color} />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        {tr?.loading ? (
-                          <>
-                            <div className="skeleton-shimmer h-4 w-3/4 mb-2" />
-                            <div className="skeleton-shimmer h-3 w-full mb-1" />
-                            <div className="skeleton-shimmer h-3 w-5/6" />
-                          </>
-                        ) : (
-                          <>
-                            <h2
-                              className={[
-                                "leading-snug font-medium text-card-foreground group-hover:text-primary transition-colors",
-                                density === "compact" ? "text-[13px]" : "text-[15px]",
-                              ].join(" ")}
-                            >
-                              {highlight(displayTitle, query)}
-                            </h2>
-                            {displaySnippet && density !== "compact" && (
-                              <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground line-clamp-2">
-                                {highlight(displaySnippet, query)}
-                              </p>
-                            )}
-                            {tr?.error && (
-                              <p className="mt-1 text-[10px] font-mono text-destructive">⚠ {tr.error}</p>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    </a>
-                  </div>
+                  <ArticleCard
+                    article={a}
+                    src={src}
+                    isUnread={isUnread}
+                    density={density}
+                    query={query}
+                    displayTitle={displayTitle}
+                    displaySnippet={displaySnippet}
+                    canTranslate={!!canTranslate}
+                    tr={tr}
+                    showTranslated={showTranslated}
+                    onTranslate={() => handleTranslate(a)}
+                    now={now}
+                    highlight={highlight}
+                  />
                 </li>
               );
             })}
@@ -504,6 +529,23 @@ export function NewsStream() {
           — end of stream · {visible.length} item{visible.length === 1 ? "" : "s"} —
         </footer>
       </main>
+
+      {showBackToTop && (
+        <button
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          className="fixed bottom-5 right-5 z-40 h-12 w-12 rounded-full border backdrop-blur-md shadow-lg flex items-center justify-center animate-stream-in transition-all hover:scale-105 active:scale-95"
+          style={{
+            backgroundColor: "color-mix(in oklab, var(--background) 70%, transparent)",
+            borderColor: "color-mix(in oklab, var(--status-live) 50%, transparent)",
+            color: "var(--status-live)",
+            boxShadow: "0 0 24px color-mix(in oklab, var(--status-live) 25%, transparent)",
+          }}
+          aria-label="Back to top"
+          title="Back to top"
+        >
+          <ArrowUp className="h-5 w-5" />
+        </button>
+      )}
 
       {settingsOpen && (
         <SettingsPanel
@@ -521,13 +563,154 @@ export function NewsStream() {
   );
 }
 
-function Thumbnail({ src, alt, srcColor }: { src?: string; alt: string; srcColor: string }) {
+// ============ Article Card with responsive (mobile compact / desktop full) layout ============
+function ArticleCard(props: {
+  article: Article;
+  src: SourceConfig;
+  isUnread: boolean;
+  density: "comfortable" | "compact";
+  query: string;
+  displayTitle: string;
+  displaySnippet: string;
+  canTranslate: boolean;
+  tr: { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean } | undefined;
+  showTranslated: boolean;
+  onTranslate: () => void;
+  now: number;
+  highlight: (text: string, q: string) => React.ReactNode;
+}) {
+  const { article: a, src, isUnread, density, query, displayTitle, displaySnippet, canTranslate, tr, showTranslated, onTranslate, now, highlight } = props;
+  const containerCls = [
+    "group relative block rounded-md border bg-card transition-all hover:bg-accent/40 hover:border-border/80",
+    density === "compact" ? "px-3 py-2" : "px-3 py-2.5 sm:px-4 sm:py-3.5",
+    a.isNew ? "animate-stream-in" : "",
+    isUnread ? "border-[color-mix(in_oklab,var(--status-live)_30%,var(--border))]" : "border-border",
+  ].join(" ");
+
+  return (
+    <div className={containerCls}>
+      {isUnread && (
+        <span
+          className="absolute left-0 top-3 h-[calc(100%-1.5rem)] w-[2px] rounded-r"
+          style={{ backgroundColor: "var(--status-live)" }}
+        />
+      )}
+
+      {/* MOBILE: tight row (image right, source+time inline, 2-line title, no snippet) */}
+      <a
+        href={a.link}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="sm:hidden flex gap-3 items-start"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
+            <SourceBadge src={src} />
+            <time className="text-[10px] font-mono text-muted-foreground tabular-nums">
+              {relativeTime(a.pubDate, now)}
+            </time>
+            {isUnread && (
+              <span className="text-[9px] font-mono uppercase tracking-wider text-[var(--status-live)]">
+                ● new
+              </span>
+            )}
+            {canTranslate && (
+              <button
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); onTranslate(); }}
+                className="ml-auto inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground hover:text-foreground"
+                aria-label="Translate"
+              >
+                {tr?.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Languages className="h-3 w-3" />}
+              </button>
+            )}
+          </div>
+          <h2 className="text-[14px] leading-snug font-medium text-card-foreground line-clamp-2 group-hover:text-primary transition-colors">
+            {highlight(displayTitle, query)}
+          </h2>
+        </div>
+        {a.thumbnail && (
+          <Thumbnail src={a.thumbnail} alt="" srcColor={src.color} size="sm" />
+        )}
+      </a>
+
+      {/* DESKTOP / tablet (sm+): existing full layout */}
+      <div className="hidden sm:block">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <SourceBadge src={src} />
+            {isUnread && (
+              <span className="text-[9px] font-mono uppercase tracking-wider text-[var(--status-live)]">
+                ● new
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {canTranslate && (
+              <button
+                onClick={(e) => { e.preventDefault(); onTranslate(); }}
+                className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                title={showTranslated ? "Show original" : `Translate from ${a.lang}`}
+              >
+                {tr?.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Languages className="h-3 w-3" />}
+                {showTranslated ? "original" : (a.lang ?? "tr").toUpperCase()}
+              </button>
+            )}
+            <time className="text-[10px] font-mono text-muted-foreground tabular-nums">
+              {relativeTime(a.pubDate, now)}
+            </time>
+          </div>
+        </div>
+        <a
+          href={a.link}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={density === "compact" ? "mt-1.5 flex gap-3" : "mt-2 flex gap-3"}
+        >
+          {density !== "compact" && a.thumbnail && (
+            <Thumbnail src={a.thumbnail} alt="" srcColor={src.color} size="md" />
+          )}
+          <div className="min-w-0 flex-1">
+            {tr?.loading ? (
+              <>
+                <div className="skeleton-shimmer h-4 w-3/4 mb-2" />
+                <div className="skeleton-shimmer h-3 w-full mb-1" />
+                <div className="skeleton-shimmer h-3 w-5/6" />
+              </>
+            ) : (
+              <>
+                <h2
+                  className={[
+                    "leading-snug font-medium text-card-foreground group-hover:text-primary transition-colors",
+                    density === "compact" ? "text-[13px]" : "text-[15px]",
+                  ].join(" ")}
+                >
+                  {highlight(displayTitle, query)}
+                </h2>
+                {displaySnippet && density !== "compact" && (
+                  <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground line-clamp-2">
+                    {highlight(displaySnippet, query)}
+                  </p>
+                )}
+                {tr?.error && (
+                  <p className="mt-1 text-[10px] font-mono text-destructive">⚠ {tr.error}</p>
+                )}
+              </>
+            )}
+          </div>
+        </a>
+      </div>
+    </div>
+  );
+}
+
+function Thumbnail({ src, alt, srcColor, size = "md" }: { src?: string; alt: string; srcColor: string; size?: "sm" | "md" }) {
   const [stage, setStage] = useState<"direct" | "proxy" | "failed">("direct");
   if (!src) return null;
+  const dim = size === "sm" ? "h-14 w-14" : "h-16 w-16";
   if (stage === "failed") {
     return (
       <div
-        className="h-16 w-16 rounded border border-border shrink-0 flex items-center justify-center"
+        className={`${dim} rounded border border-border shrink-0 flex items-center justify-center`}
         style={{ backgroundColor: `color-mix(in oklab, ${srcColor} 14%, transparent)` }}
       >
         <ImageOff className="h-5 w-5" style={{ color: srcColor }} />
@@ -541,7 +724,7 @@ function Thumbnail({ src, alt, srcColor }: { src?: string; alt: string; srcColor
       alt={alt}
       loading="lazy"
       referrerPolicy="no-referrer"
-      className="h-16 w-16 rounded object-cover border border-border shrink-0 bg-muted/40"
+      className={`${dim} rounded object-cover border border-border shrink-0 bg-muted/40`}
       onError={() => setStage(stage === "direct" ? "proxy" : "failed")}
     />
   );
@@ -556,7 +739,7 @@ function FilterChip({
     <button
       onClick={onClick}
       className={[
-        "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-mono uppercase tracking-wide transition-colors",
+        "inline-flex items-center gap-1 rounded-full border px-3 py-1.5 text-[11px] font-mono uppercase tracking-wide transition-colors",
         active
           ? "border-foreground/60 bg-foreground text-background"
           : "border-border bg-transparent text-muted-foreground hover:text-foreground hover:border-foreground/40",
@@ -564,7 +747,7 @@ function FilterChip({
       style={active && color ? { backgroundColor: color, color: "var(--background)", borderColor: color } : undefined}
       title={error ? "Feed error — last fetch failed" : undefined}
     >
-      {error && !active && <AlertTriangle className="h-2.5 w-2.5 text-destructive" />}
+      {error && !active && <AlertTriangle className="h-3 w-3 text-destructive" />}
       {label}
     </button>
   );
@@ -584,7 +767,6 @@ function SettingsPanel({
 }) {
   const [openCat, setOpenCat] = useState<SourceCategory | null>("danish");
 
-  // custom form state
   const [cLabel, setCLabel] = useState("");
   const [cUrl, setCUrl] = useState("");
   const [cColor, setCColor] = useState("oklch(0.7 0.18 200)");
@@ -614,20 +796,24 @@ function SettingsPanel({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-background/70 backdrop-blur-sm flex items-center justify-center p-4 animate-stream-in"
+      className="fixed inset-0 z-50 bg-background/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-stream-in"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-lg border border-border bg-card shadow-2xl flex flex-col max-h-[85vh]"
+        className="w-full max-w-md rounded-t-lg sm:rounded-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90vh] sm:max-h-[85vh]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3 shrink-0">
-          <h2 className="font-mono text-sm uppercase tracking-widest">// sources</h2>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
-            <X className="h-4 w-4" />
+          <h2 className="font-mono text-sm uppercase tracking-widest">// Sources</h2>
+          <button
+            onClick={onClose}
+            className="text-muted-foreground hover:text-foreground p-2 -mr-2"
+            aria-label="Close"
+          >
+            <X className="h-5 w-5" />
           </button>
         </div>
-        <div className="overflow-y-auto thin-scroll flex-1 p-2 space-y-1">
+        <div className="overflow-y-auto thin-scroll flex-1 p-2 space-y-1.5">
           {CATEGORY_ORDER.map((cat) => {
             const items = grouped[cat];
             const meta = CATEGORY_META[cat];
@@ -637,10 +823,10 @@ function SettingsPanel({
               <div key={cat} className="rounded border border-border bg-background/40">
                 <button
                   onClick={() => setOpenCat(open ? null : cat)}
-                  className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-accent/40 transition-colors"
+                  className="w-full flex items-center justify-between px-3 py-3 text-left hover:bg-accent/40 transition-colors min-h-12"
                 >
                   <span className="flex items-center gap-2 text-sm">
-                    <span>{meta.emoji}</span>
+                    <span className="text-base">{meta.emoji}</span>
                     <span className="font-medium">{meta.label}</span>
                     <span className="text-[10px] font-mono text-muted-foreground">
                       {enabledCount}/{items.length}
@@ -653,23 +839,23 @@ function SettingsPanel({
                 {open && (
                   <div className="border-t border-border px-2 pt-2 pb-2">
                     {cat !== "custom" && items.length > 0 && (
-                      <div className="flex items-center gap-2 px-1 pb-2 text-[10px] font-mono">
+                      <div className="flex items-center gap-3 px-1 pb-2 text-[11px] font-mono">
                         <button
                           onClick={() => onCategoryAll(cat, true)}
-                          className="text-muted-foreground hover:text-[var(--status-live)] underline-offset-2 hover:underline"
+                          className="text-muted-foreground hover:text-[var(--status-live)] underline-offset-2 hover:underline py-1"
                         >
                           select all
                         </button>
                         <span className="text-muted-foreground/50">·</span>
                         <button
                           onClick={() => onCategoryAll(cat, false)}
-                          className="text-muted-foreground hover:text-destructive underline-offset-2 hover:underline"
+                          className="text-muted-foreground hover:text-destructive underline-offset-2 hover:underline py-1"
                         >
                           deselect all
                         </button>
                       </div>
                     )}
-                    <div className={`grid grid-cols-1 gap-1 ${items.length > 4 ? "max-h-56 overflow-y-auto thin-scroll fade-mask pr-1" : ""}`}>
+                    <div className={`grid grid-cols-1 gap-1 ${items.length > 5 ? "max-h-72 overflow-y-auto thin-scroll fade-mask pr-1" : ""}`}>
                       {items.map((src) => {
                         const on = enabled.includes(src.key);
                         const status = statuses[src.key];
@@ -678,49 +864,50 @@ function SettingsPanel({
                         return (
                           <div
                             key={src.key}
-                            className="flex items-center gap-2 rounded px-2 py-1.5 hover:bg-accent/40 transition-colors"
+                            className="flex items-center gap-2 rounded px-2 py-2 min-h-12 hover:bg-accent/40 transition-colors"
                           >
                             <button
                               onClick={() => onToggle(src.key)}
-                              className="flex items-center gap-2 flex-1 min-w-0 text-left"
+                              className="flex items-center gap-2.5 flex-1 min-w-0 text-left py-1"
                             >
-                              <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: src.color }} />
+                              <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: src.color }} />
                               <span className="text-sm text-card-foreground truncate">{src.label}</span>
                               {hasError && (
-                                <AlertTriangle className="h-3 w-3 text-destructive shrink-0" />
+                                <AlertTriangle className="h-3.5 w-3.5 text-destructive shrink-0" />
                               )}
                               <span
                                 className={[
-                                  "ml-auto h-4 w-4 rounded border flex items-center justify-center shrink-0",
+                                  "ml-auto h-5 w-5 rounded border flex items-center justify-center shrink-0",
                                   on
                                     ? "border-[var(--status-live)] bg-[color-mix(in_oklab,var(--status-live)_22%,transparent)]"
                                     : "border-border",
                                 ].join(" ")}
                               >
-                                {on && <Check className="h-2.5 w-2.5 text-[var(--status-live)]" />}
+                                {on && <Check className="h-3 w-3 text-[var(--status-live)]" />}
                               </span>
                             </button>
                             {isCustom && (
                               <button
                                 onClick={() => removeCustom(src.key)}
-                                className="text-muted-foreground hover:text-destructive p-1"
+                                className="text-muted-foreground hover:text-destructive p-2"
                                 title="Remove custom feed"
+                                aria-label="Remove custom feed"
                               >
-                                <Trash2 className="h-3.5 w-3.5" />
+                                <Trash2 className="h-4 w-4" />
                               </button>
                             )}
                           </div>
                         );
                       })}
                       {cat === "custom" && items.length === 0 && (
-                        <p className="text-[11px] font-mono text-muted-foreground px-2 py-1">
+                        <p className="text-[11px] font-mono text-muted-foreground px-2 py-2">
                           no custom feeds yet — add one below
                         </p>
                       )}
                     </div>
 
                     {cat === "custom" && (
-                      <div className="mt-3 border-t border-border pt-3 space-y-2">
+                      <div className="mt-3 border-t border-border pt-3 space-y-2.5">
                         <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">
                           + add custom feed
                         </div>
@@ -728,17 +915,17 @@ function SettingsPanel({
                           value={cLabel}
                           onChange={(e) => setCLabel(e.target.value)}
                           placeholder="Label (e.g. My Blog)"
-                          className="w-full rounded border border-border bg-muted/40 px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-ring"
+                          className="w-full rounded-md border border-border bg-muted/40 px-3 py-2.5 text-sm font-mono focus:outline-none focus:border-ring"
                         />
                         <input
                           value={cUrl}
                           onChange={(e) => setCUrl(e.target.value)}
                           placeholder="https://example.com/feed.xml"
-                          className="w-full rounded border border-border bg-muted/40 px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-ring"
+                          className="w-full rounded-md border border-border bg-muted/40 px-3 py-2.5 text-sm font-mono focus:outline-none focus:border-ring"
                         />
-                        <div className="flex items-center gap-2">
-                          <label className="text-[10px] font-mono text-muted-foreground">color</label>
-                          <div className="flex gap-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <label className="text-[11px] font-mono text-muted-foreground">color</label>
+                          <div className="flex gap-1.5">
                             {[
                               "oklch(0.7 0.18 200)", "oklch(0.7 0.2 50)", "oklch(0.65 0.22 25)",
                               "oklch(0.7 0.2 320)", "oklch(0.75 0.2 140)", "oklch(0.85 0.005 250)",
@@ -746,15 +933,17 @@ function SettingsPanel({
                               <button
                                 key={c}
                                 onClick={() => setCColor(c)}
-                                className={`h-5 w-5 rounded-full border-2 transition ${cColor === c ? "border-foreground" : "border-transparent"}`}
+                                className={`h-7 w-7 rounded-full border-2 transition ${cColor === c ? "border-foreground" : "border-transparent"}`}
                                 style={{ backgroundColor: c }}
+                                aria-label={`Color ${c}`}
                               />
                             ))}
                           </div>
                           <select
                             value={cLang}
                             onChange={(e) => setCLang(e.target.value)}
-                            className="ml-auto rounded border border-border bg-muted/40 px-2 py-1 text-[10px] font-mono"
+                            className="ml-auto rounded-md border border-border bg-muted/40 px-2.5 py-2 text-xs font-mono"
+                            aria-label="Language"
                           >
                             <option value="en">en</option>
                             <option value="it">it</option>
@@ -765,13 +954,13 @@ function SettingsPanel({
                           </select>
                         </div>
                         {formError && (
-                          <p className="text-[10px] font-mono text-destructive">⚠ {formError}</p>
+                          <p className="text-[11px] font-mono text-destructive">⚠ {formError}</p>
                         )}
                         <button
                           onClick={addCustom}
-                          className="w-full inline-flex items-center justify-center gap-1 rounded border border-[var(--status-live)]/50 bg-[color-mix(in_oklab,var(--status-live)_15%,transparent)] px-2 py-1.5 text-xs font-mono text-[var(--status-live)] hover:bg-[color-mix(in_oklab,var(--status-live)_25%,transparent)] transition-colors"
+                          className="w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-[var(--status-live)]/50 bg-[color-mix(in_oklab,var(--status-live)_15%,transparent)] px-3 py-3 text-sm font-mono text-[var(--status-live)] hover:bg-[color-mix(in_oklab,var(--status-live)_25%,transparent)] transition-colors min-h-12"
                         >
-                          <Plus className="h-3.5 w-3.5" /> add feed
+                          <Plus className="h-4 w-4" /> Add Feed
                         </button>
                       </div>
                     )}
@@ -781,7 +970,7 @@ function SettingsPanel({
             );
           })}
         </div>
-        <div className="border-t border-border px-4 py-2.5 text-[10px] font-mono text-muted-foreground shrink-0 flex items-center justify-between">
+        <div className="border-t border-border px-4 py-3 text-[10px] font-mono text-muted-foreground shrink-0 flex items-center justify-between">
           <span>saved locally · {enabled.length} active</span>
           <span>{SOURCE_CATALOG.length + customSources.length} total</span>
         </div>
