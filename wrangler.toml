@@ -1,0 +1,7 @@
+name = "news-reader"
+compatibility_date = "2026-06-09"
+compatibility_flags = ["nodejs_compat"]
+main = ".output/server/index.mjs"
+
+[assets]
+directory = ".output/public"

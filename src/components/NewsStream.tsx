@@ -1,11 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Settings2, Search, X, ArrowUp, Rows3, Rows4, Check, Languages,
-  ChevronDown, Plus, Trash2, ImageOff, Loader2, AlertTriangle,
+  Settings2,
+  Search,
+  X,
+  ArrowUp,
+  Rows3,
+  Rows4,
+  Check,
+  Languages,
+  ChevronDown,
+  Plus,
+  Trash2,
+  ImageOff,
+  Loader2,
+  AlertTriangle,
 } from "lucide-react";
 import {
-  SOURCE_CATALOG, DEFAULT_ENABLED, CATEGORY_META, CATEGORY_ORDER,
-  buildCatalog, getSource, feednamiApi, type SourceConfig, type SourceCategory,
+  SOURCE_CATALOG,
+  DEFAULT_ENABLED,
+  CATEGORY_META,
+  CATEGORY_ORDER,
+  buildCatalog,
+  getSource,
+  type SourceConfig,
+  type SourceCategory,
   type CustomSource,
 } from "@/lib/news-sources";
 import { useLocalStorage } from "@/hooks/use-local-storage";
@@ -39,7 +57,10 @@ const BACKOFF_MS = 90_000;
 
 function stripHtml(html: string): string {
   if (!html) return "";
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function relativeTime(ts: number, now: number): string {
@@ -53,12 +74,23 @@ function relativeTime(ts: number, now: number): string {
   return `${days}d ago`;
 }
 
-function extractThumbnail(item: any): string | undefined {
-  if (item.thumbnail && typeof item.thumbnail === "string" && item.thumbnail.startsWith("http")) return item.thumbnail;
+interface ThumbnailSource {
+  thumbnail?: string;
+  enclosure?: { link?: string };
+  enclosures?: Array<{ url?: string }>;
+  image?: string | { url?: string };
+  content?: string;
+  description?: string;
+  summary?: string;
+}
+
+function extractThumbnail(item: ThumbnailSource): string | undefined {
+  if (item.thumbnail && typeof item.thumbnail === "string" && item.thumbnail.startsWith("http"))
+    return item.thumbnail;
   if (item.enclosure?.link) return item.enclosure.link;
   if (item.enclosures && item.enclosures[0]?.url) return item.enclosures[0].url;
   if (item.image) return typeof item.image === "string" ? item.image : item.image.url;
-  const html = (item.content || item.description || item.summary || "") as string;
+  const html = item.content || item.description || item.summary || "";
   const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
   return m?.[1];
 }
@@ -76,61 +108,114 @@ function parseDate(s: string | undefined): number {
   return Number.isFinite(t2) ? t2 : Date.now();
 }
 
-function mapRss2Json(json: any, src: SourceConfig): Article[] {
-  if (!Array.isArray(json?.items)) throw new Error("Bad payload");
-  return json.items.slice(0, 25).map((item: any, idx: number): Article => ({
-    id: `${src.key}-${item.guid || item.link || idx}`,
-    sourceKey: src.key,
-    title: stripHtml(item.title || "Untitled"),
-    snippet: stripHtml(item.description || item.content || "").slice(0, 220),
-    link: item.link || "#",
-    pubDate: parseDate(item.pubDate),
-    thumbnail: extractThumbnail(item),
-    lang: src.lang,
-  }));
+function textContent(el: Element | null | undefined): string {
+  return el?.textContent?.trim() ?? "";
 }
 
-function mapFeednami(json: any, src: SourceConfig): Article[] {
-  const entries = json?.feed?.entries;
-  if (!Array.isArray(entries)) throw new Error("Bad fallback payload");
-  return entries.slice(0, 25).map((item: any, idx: number): Article => ({
-    id: `${src.key}-${item.guid || item.url || idx}`,
-    sourceKey: src.key,
-    title: stripHtml(item.title || "Untitled"),
-    snippet: stripHtml(item.description || item.contentSnippet || item.content || "").slice(0, 220),
-    link: item.url || item.link || "#",
-    pubDate: parseDate(item.published || item.pubDate),
-    thumbnail: extractThumbnail(item),
-    lang: src.lang,
-  }));
+function firstChildText(parent: Element, selectors: string[]): string {
+  for (const sel of selectors) {
+    const el = parent.querySelector(sel);
+    const t = textContent(el);
+    if (t) return t;
+  }
+  return "";
 }
 
-async function fetchSource(src: SourceConfig): Promise<{ articles: Article[]; status: FeedStatus }> {
+function extractXmlThumbnail(item: Element): string | undefined {
+  const enclosure = item.querySelector("enclosure");
+  const encUrl = enclosure?.getAttribute("url");
+  if (encUrl?.startsWith("http")) return encUrl;
+
+  const media = item.querySelector("media\\:content, content");
+  const mediaUrl = media?.getAttribute("url");
+  if (mediaUrl?.startsWith("http")) return mediaUrl;
+
+  const html = firstChildText(item, ["content\\:encoded", "description", "summary", "content"]);
+  const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+  return m?.[1];
+}
+
+function mapXmlItem(item: Element, src: SourceConfig, idx: number, isAtom: boolean): Article {
+  const title =
+    stripHtml(isAtom ? firstChildText(item, ["title"]) : firstChildText(item, ["title"])) ||
+    "Untitled";
+
+  const link = isAtom
+    ? (item.querySelector("link")?.getAttribute("href") ?? firstChildText(item, ["id"]))
+    : firstChildText(item, ["link"]) || textContent(item.querySelector("guid"));
+
+  const guid = isAtom ? firstChildText(item, ["id"]) : textContent(item.querySelector("guid"));
+
+  const snippetRaw = isAtom
+    ? firstChildText(item, ["summary", "content"])
+    : firstChildText(item, ["description", "content\\:encoded", "summary"]);
+
+  const pubRaw = isAtom
+    ? firstChildText(item, ["published", "updated"])
+    : firstChildText(item, ["pubDate", "dc\\:date", "published"]);
+
+  const thumbItem = {
+    thumbnail: undefined as string | undefined,
+    enclosure: link ? { link } : undefined,
+    content: snippetRaw,
+    description: snippetRaw,
+  };
+  const thumbnail = extractXmlThumbnail(item) ?? extractThumbnail(thumbItem);
+
+  return {
+    id: `${src.key}-${guid || link || idx}`,
+    sourceKey: src.key,
+    title,
+    snippet: stripHtml(snippetRaw).slice(0, 220),
+    link: link || "#",
+    pubDate: parseDate(pubRaw),
+    thumbnail,
+    lang: src.lang,
+  };
+}
+
+function parseRssXml(xml: string, src: SourceConfig): Article[] {
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  if (doc.querySelector("parsererror")) throw new Error("Invalid XML");
+
+  const atomEntries = doc.querySelectorAll("entry");
+  if (atomEntries.length > 0) {
+    return Array.from(atomEntries)
+      .slice(0, 25)
+      .map((item, idx) => mapXmlItem(item, src, idx, true));
+  }
+
+  const rssItems = doc.querySelectorAll("item");
+  if (rssItems.length === 0) throw new Error("No feed items found");
+
+  return Array.from(rssItems)
+    .slice(0, 25)
+    .map((item, idx) => mapXmlItem(item, src, idx, false));
+}
+
+async function fetchSource(
+  src: SourceConfig,
+): Promise<{ articles: Article[]; status: FeedStatus }> {
   const tried = Date.now();
-  // Primary: rss2json
   try {
-    const res = await fetch(src.feedUrl, { cache: "no-store" });
+    const res = await fetch(`/api/fetch-rss?url=${encodeURIComponent(src.rssUrl)}`, {
+      cache: "no-store",
+      credentials: "include",
+    });
     if (res.status === 429 || res.status === 433) throw new Error(`HTTP ${res.status}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    if (json.status && json.status !== "ok") throw new Error(json.message || "Feed error");
-    const articles = mapRss2Json(json, src);
-    return { articles, status: { ok: true, lastTried: tried, lastSuccess: tried, consecutiveFailures: 0 } };
-  } catch (primaryErr) {
-    // Fallback: feednami
-    try {
-      const res = await fetch(feednamiApi(src.rssUrl), { cache: "no-store" });
-      if (!res.ok) throw new Error(`fallback HTTP ${res.status}`);
-      const json = await res.json();
-      const articles = mapFeednami(json, src);
-      return { articles, status: { ok: true, lastTried: tried, lastSuccess: tried, consecutiveFailures: 0 } };
-    } catch (fallbackErr) {
-      const msg = primaryErr instanceof Error ? primaryErr.message : "Failed";
-      return {
-        articles: [],
-        status: { ok: false, error: msg, lastTried: tried },
-      };
-    }
+    const xml = await res.text();
+    const articles = parseRssXml(xml, src);
+    return {
+      articles,
+      status: { ok: true, lastTried: tried, lastSuccess: tried, consecutiveFailures: 0 },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed";
+    return {
+      articles: [],
+      status: { ok: false, error: msg, lastTried: tried },
+    };
   }
 }
 
@@ -139,7 +224,13 @@ function highlight(text: string, query: string): React.ReactNode {
   const q = query.trim();
   const parts = text.split(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "ig"));
   return parts.map((p, i) =>
-    p.toLowerCase() === q.toLowerCase() ? <mark key={i} className="hl">{p}</mark> : <span key={i}>{p}</span>,
+    p.toLowerCase() === q.toLowerCase() ? (
+      <mark key={i} className="hl">
+        {p}
+      </mark>
+    ) : (
+      <span key={i}>{p}</span>
+    ),
   );
 }
 
@@ -161,18 +252,23 @@ function SourceBadge({ src }: { src: SourceConfig }) {
 export function NewsStream() {
   // ---- Hydration gate: client-only render ----
   const [mounted, setMounted] = useState(false);
-  useEffect(() => { setMounted(true); }, []);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
   if (!mounted) {
     return (
       <div className="min-h-screen text-foreground">
-        <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border">
+        <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border pt-[env(safe-area-inset-top,0px)]">
           <div className="mx-auto max-w-2xl px-4 sm:px-6 py-3">
             <div className="h-7 w-40 rounded skeleton-shimmer" />
           </div>
         </header>
         <main className="mx-auto max-w-2xl px-4 sm:px-6 py-6 space-y-3">
           {[0, 1, 2, 3, 4].map((i) => (
-            <div key={i} className="h-20 rounded-md border border-border bg-card/40 animate-pulse" />
+            <div
+              key={i}
+              className="h-20 rounded-md border border-border bg-card/40 animate-pulse"
+            />
           ))}
         </main>
       </div>
@@ -182,10 +278,19 @@ export function NewsStream() {
 }
 
 function NewsStreamInner() {
-  const [customSources, setCustomSources] = useLocalStorage<CustomSource[]>("ns:custom-sources", []);
-  const [enabledSources, setEnabledSources] = useLocalStorage<string[]>("ns:enabled-sources", DEFAULT_ENABLED);
+  const [customSources, setCustomSources] = useLocalStorage<CustomSource[]>(
+    "ns:custom-sources",
+    [],
+  );
+  const [enabledSources, setEnabledSources] = useLocalStorage<string[]>(
+    "ns:enabled-sources",
+    DEFAULT_ENABLED,
+  );
   const [activeFilter, setActiveFilter] = useLocalStorage<string>("ns:active-filter", "all");
-  const [density, setDensity] = useLocalStorage<"comfortable" | "compact">("ns:density", "comfortable");
+  const [density, setDensity] = useLocalStorage<"comfortable" | "compact">(
+    "ns:density",
+    "comfortable",
+  );
   const [lastVisit, setLastVisit] = useLocalStorage<number>("ns:last-visit", Date.now());
   const [query, setQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -198,7 +303,10 @@ function NewsStreamInner() {
   const [pendingNew, setPendingNew] = useState(0);
   const [showBackToTop, setShowBackToTop] = useState(false);
   const [translations, setTranslations] = useState<
-    Record<string, { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean }>
+    Record<
+      string,
+      { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean }
+    >
   >({});
 
   const seenRef = useRef<Set<string>>(new Set());
@@ -225,9 +333,21 @@ function NewsStreamInner() {
 
   const fullCatalog = useMemo(() => buildCatalog(customSources), [customSources]);
   const enabledConfigs = useMemo(
-    () => enabledSources.map((k) => fullCatalog.find((s) => s.key === k)).filter(Boolean) as SourceConfig[],
+    () =>
+      enabledSources
+        .map((k) => fullCatalog.find((s) => s.key === k))
+        .filter(Boolean) as SourceConfig[],
     [enabledSources, fullCatalog],
   );
+
+  const groupedEnabledFilters = useMemo(() => {
+    const groups: { category: SourceCategory; sources: SourceConfig[] }[] = [];
+    for (const cat of CATEGORY_ORDER) {
+      const sources = enabledConfigs.filter((s) => s.category === cat);
+      if (sources.length > 0) groups.push({ category: cat, sources });
+    }
+    return groups;
+  }, [enabledConfigs]);
 
   useEffect(() => {
     let mounted = true;
@@ -272,7 +392,10 @@ function NewsStreamInner() {
       for (const a of merged) {
         let dup = false;
         for (let i = 0; i < kept.length; i++) {
-          if (isNearDuplicate(a.title, kept[i].title)) { dup = true; break; }
+          if (isNearDuplicate(a.title, kept[i].title)) {
+            dup = true;
+            break;
+          }
         }
         if (!dup) kept.push(a);
       }
@@ -312,14 +435,14 @@ function NewsStreamInner() {
       clearInterval(poll);
       clearInterval(tick);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabledConfigs]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return articles.filter((a) => {
       if (activeFilter !== "all" && a.sourceKey !== activeFilter) return false;
-      if (q && !a.title.toLowerCase().includes(q) && !a.snippet.toLowerCase().includes(q)) return false;
+      if (q && !a.title.toLowerCase().includes(q) && !a.snippet.toLowerCase().includes(q))
+        return false;
       return true;
     });
   }, [articles, activeFilter, query]);
@@ -364,18 +487,25 @@ function NewsStreamInner() {
         translateText(a.title, from, USER_LANG),
         a.snippet ? translateText(a.snippet, from, USER_LANG) : Promise.resolve(""),
       ]);
-      setTranslations((p) => ({ ...p, [a.id]: { title: t, snippet: s, loading: false, shown: true } }));
+      setTranslations((p) => ({
+        ...p,
+        [a.id]: { title: t, snippet: s, loading: false, shown: true },
+      }));
     } catch (err) {
       setTranslations((p) => ({
         ...p,
-        [a.id]: { loading: false, shown: true, error: err instanceof Error ? err.message : "Translation failed" },
+        [a.id]: {
+          loading: false,
+          shown: true,
+          error: err instanceof Error ? err.message : "Translation failed",
+        },
       }));
     }
   };
 
   return (
     <div className="min-h-screen text-foreground">
-      <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border">
+      <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/80 border-b border-border pt-[env(safe-area-inset-top,0px)]">
         <div className="mx-auto max-w-2xl px-3 sm:px-6 py-3 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <span
@@ -388,7 +518,10 @@ function NewsStreamInner() {
             >
               <span
                 className="h-1.5 w-1.5 rounded-full animate-pulse-dot"
-                style={{ backgroundColor: "var(--status-live)", boxShadow: "0 0 8px var(--status-live)" }}
+                style={{
+                  backgroundColor: "var(--status-live)",
+                  boxShadow: "0 0 8px var(--status-live)",
+                }}
               />
               <span className="hidden xs:inline sm:inline">Live Stream</span>
               <span className="xs:hidden sm:hidden">LIVE</span>
@@ -400,7 +533,11 @@ function NewsStreamInner() {
                 title={`Density: ${density}`}
                 aria-label="Toggle density"
               >
-                {density === "comfortable" ? <Rows3 className="h-4 w-4" /> : <Rows4 className="h-4 w-4" />}
+                {density === "comfortable" ? (
+                  <Rows3 className="h-4 w-4" />
+                ) : (
+                  <Rows4 className="h-4 w-4" />
+                )}
               </button>
               <button
                 onClick={() => setSettingsOpen(true)}
@@ -419,7 +556,7 @@ function NewsStreamInner() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="search the stream…"
-              className="w-full rounded-md border border-border bg-muted/40 pl-9 pr-9 py-2.5 text-sm font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:border-ring transition-colors"
+              className="w-full min-h-11 rounded-md border border-border bg-muted/40 pl-9 pr-9 py-2.5 text-sm font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:border-ring transition-colors"
             />
             {query && (
               <button
@@ -432,24 +569,46 @@ function NewsStreamInner() {
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-1.5">
-            <FilterChip label="All" active={activeFilter === "all"} onClick={() => setActiveFilter("all")} />
-            {enabledConfigs.map((src) => (
-              <FilterChip
-                key={src.key}
-                label={src.label}
-                color={src.color}
-                active={activeFilter === src.key}
-                error={statuses[src.key] && !statuses[src.key].ok}
-                onClick={() => setActiveFilter(src.key)}
-              />
+          <div className="flex flex-row flex-nowrap overflow-x-auto thin-scroll whitespace-nowrap gap-2 py-2 px-1 sm:flex-wrap sm:overflow-visible sm:whitespace-normal">
+            <FilterChip
+              label="All"
+              active={activeFilter === "all"}
+              onClick={() => setActiveFilter("all")}
+            />
+            {groupedEnabledFilters.map((group, gi) => (
+              <span key={group.category} className="inline-flex items-center gap-2 shrink-0">
+                {gi > 0 && (
+                  <span className="text-muted-foreground/40 select-none" aria-hidden="true">
+                    ·
+                  </span>
+                )}
+                <span
+                  className="text-xs select-none sm:hidden"
+                  title={CATEGORY_META[group.category].label}
+                  aria-hidden="true"
+                >
+                  {CATEGORY_META[group.category].emoji}
+                </span>
+                {group.sources.map((src) => (
+                  <FilterChip
+                    key={src.key}
+                    label={src.label}
+                    color={src.color}
+                    active={activeFilter === src.key}
+                    error={statuses[src.key] && !statuses[src.key].ok}
+                    onClick={() => setActiveFilter(src.key)}
+                  />
+                ))}
+              </span>
             ))}
           </div>
 
           <div className="flex items-center justify-between text-[10px] font-mono text-muted-foreground tabular-nums">
             <span>
               {unreadCount > 0 ? (
-                <span className="text-[var(--status-live)]">● {unreadCount} new since last visit</span>
+                <span className="text-[var(--status-live)]">
+                  ● {unreadCount} new since last visit
+                </span>
               ) : (
                 <span>// no new since {relativeTime(sessionStartRef.current, now)}</span>
               )}
@@ -463,7 +622,7 @@ function NewsStreamInner() {
         <div className="sticky top-[var(--header-h,140px)] z-20 flex justify-center pointer-events-none">
           <button
             onClick={onShowNew}
-            className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-4 py-2 text-xs font-mono shadow-lg animate-stream-in"
+            className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-4 py-2 min-h-11 text-xs font-mono shadow-lg animate-stream-in"
             style={{
               backgroundColor: "color-mix(in oklab, var(--status-live) 22%, var(--background))",
               borderColor: "color-mix(in oklab, var(--status-live) 50%, transparent)",
@@ -573,18 +732,36 @@ function ArticleCard(props: {
   displayTitle: string;
   displaySnippet: string;
   canTranslate: boolean;
-  tr: { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean } | undefined;
+  tr:
+    | { title?: string; snippet?: string; loading?: boolean; error?: string; shown?: boolean }
+    | undefined;
   showTranslated: boolean;
   onTranslate: () => void;
   now: number;
   highlight: (text: string, q: string) => React.ReactNode;
 }) {
-  const { article: a, src, isUnread, density, query, displayTitle, displaySnippet, canTranslate, tr, showTranslated, onTranslate, now, highlight } = props;
+  const {
+    article: a,
+    src,
+    isUnread,
+    density,
+    query,
+    displayTitle,
+    displaySnippet,
+    canTranslate,
+    tr,
+    showTranslated,
+    onTranslate,
+    now,
+    highlight,
+  } = props;
   const containerCls = [
     "group relative block rounded-md border bg-card transition-all hover:bg-accent/40 hover:border-border/80",
     density === "compact" ? "px-3 py-2" : "px-3 py-2.5 sm:px-4 sm:py-3.5",
     a.isNew ? "animate-stream-in" : "",
-    isUnread ? "border-[color-mix(in_oklab,var(--status-live)_30%,var(--border))]" : "border-border",
+    isUnread
+      ? "border-[color-mix(in_oklab,var(--status-live)_30%,var(--border))]"
+      : "border-border",
   ].join(" ");
 
   return (
@@ -616,11 +793,19 @@ function ArticleCard(props: {
             )}
             {canTranslate && (
               <button
-                onClick={(e) => { e.preventDefault(); e.stopPropagation(); onTranslate(); }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onTranslate();
+                }}
                 className="ml-auto inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground hover:text-foreground"
                 aria-label="Translate"
               >
-                {tr?.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Languages className="h-3 w-3" />}
+                {tr?.loading ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Languages className="h-3 w-3" />
+                )}
               </button>
             )}
           </div>
@@ -628,9 +813,7 @@ function ArticleCard(props: {
             {highlight(displayTitle, query)}
           </h2>
         </div>
-        {a.thumbnail && (
-          <Thumbnail src={a.thumbnail} alt="" srcColor={src.color} size="sm" />
-        )}
+        {a.thumbnail && <Thumbnail src={a.thumbnail} alt="" srcColor={src.color} size="sm" />}
       </a>
 
       {/* DESKTOP / tablet (sm+): existing full layout */}
@@ -647,11 +830,18 @@ function ArticleCard(props: {
           <div className="flex items-center gap-2">
             {canTranslate && (
               <button
-                onClick={(e) => { e.preventDefault(); onTranslate(); }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  onTranslate();
+                }}
                 className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
                 title={showTranslated ? "Show original" : `Translate from ${a.lang}`}
               >
-                {tr?.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Languages className="h-3 w-3" />}
+                {tr?.loading ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Languages className="h-3 w-3" />
+                )}
                 {showTranslated ? "original" : (a.lang ?? "tr").toUpperCase()}
               </button>
             )}
@@ -703,7 +893,17 @@ function ArticleCard(props: {
   );
 }
 
-function Thumbnail({ src, alt, srcColor, size = "md" }: { src?: string; alt: string; srcColor: string; size?: "sm" | "md" }) {
+function Thumbnail({
+  src,
+  alt,
+  srcColor,
+  size = "md",
+}: {
+  src?: string;
+  alt: string;
+  srcColor: string;
+  size?: "sm" | "md";
+}) {
   const [stage, setStage] = useState<"direct" | "proxy" | "failed">("direct");
   if (!src) return null;
   const dim = size === "sm" ? "h-14 w-14" : "h-16 w-16";
@@ -731,20 +931,32 @@ function Thumbnail({ src, alt, srcColor, size = "md" }: { src?: string; alt: str
 }
 
 function FilterChip({
-  label, active, onClick, color, error,
+  label,
+  active,
+  onClick,
+  color,
+  error,
 }: {
-  label: string; active: boolean; onClick: () => void; color?: string; error?: boolean;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  color?: string;
+  error?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       className={[
-        "inline-flex items-center gap-1 rounded-full border px-3 py-1.5 text-[11px] font-mono uppercase tracking-wide transition-colors",
+        "inline-flex items-center gap-1 rounded-full border px-3 min-h-11 text-[11px] font-mono uppercase tracking-wide transition-colors shrink-0",
         active
           ? "border-foreground/60 bg-foreground text-background"
           : "border-border bg-transparent text-muted-foreground hover:text-foreground hover:border-foreground/40",
       ].join(" ")}
-      style={active && color ? { backgroundColor: color, color: "var(--background)", borderColor: color } : undefined}
+      style={
+        active && color
+          ? { backgroundColor: color, color: "var(--background)", borderColor: color }
+          : undefined
+      }
       title={error ? "Feed error — last fetch failed" : undefined}
     >
       {error && !active && <AlertTriangle className="h-3 w-3 text-destructive" />}
@@ -754,7 +966,14 @@ function FilterChip({
 }
 
 function SettingsPanel({
-  enabled, onToggle, onCategoryAll, onClose, statuses, customSources, setCustomSources, fullCatalog,
+  enabled,
+  onToggle,
+  onCategoryAll,
+  onClose,
+  statuses,
+  customSources,
+  setCustomSources,
+  fullCatalog,
 }: {
   enabled: string[];
   onToggle: (k: string) => void;
@@ -777,12 +996,21 @@ function SettingsPanel({
     setFormError(null);
     const label = cLabel.trim();
     const url = cUrl.trim();
-    if (!label || !url) { setFormError("Label and URL are required"); return; }
-    try { new URL(url); } catch { setFormError("Invalid URL"); return; }
+    if (!label || !url) {
+      setFormError("Label and URL are required");
+      return;
+    }
+    try {
+      new URL(url);
+    } catch {
+      setFormError("Invalid URL");
+      return;
+    }
     const key = `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const next: CustomSource = { key, label, rssUrl: url, color: cColor, lang: cLang || undefined };
     setCustomSources((p) => [...p, next]);
-    setCLabel(""); setCUrl("");
+    setCLabel("");
+    setCUrl("");
   };
 
   const removeCustom = (key: string) => {
@@ -790,9 +1018,15 @@ function SettingsPanel({
   };
 
   const grouped: Record<SourceCategory, SourceConfig[]> = {
-    italian: [], danish: [], international: [], tech: [], custom: [],
+    italian: [],
+    danish: [],
+    international: [],
+    tech: [],
+    custom: [],
   };
-  fullCatalog.forEach((s) => { grouped[s.category].push(s); });
+  fullCatalog.forEach((s) => {
+    grouped[s.category].push(s);
+  });
 
   return (
     <div
@@ -855,7 +1089,9 @@ function SettingsPanel({
                         </button>
                       </div>
                     )}
-                    <div className={`grid grid-cols-1 gap-1 ${items.length > 5 ? "max-h-72 overflow-y-auto thin-scroll fade-mask pr-1" : ""}`}>
+                    <div
+                      className={`grid grid-cols-1 gap-1 ${items.length > 5 ? "max-h-72 overflow-y-auto thin-scroll fade-mask pr-1" : ""}`}
+                    >
                       {items.map((src) => {
                         const on = enabled.includes(src.key);
                         const status = statuses[src.key];
@@ -870,8 +1106,13 @@ function SettingsPanel({
                               onClick={() => onToggle(src.key)}
                               className="flex items-center gap-2.5 flex-1 min-w-0 text-left py-1"
                             >
-                              <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: src.color }} />
-                              <span className="text-sm text-card-foreground truncate">{src.label}</span>
+                              <span
+                                className="h-2.5 w-2.5 rounded-full shrink-0"
+                                style={{ backgroundColor: src.color }}
+                              />
+                              <span className="text-sm text-card-foreground truncate">
+                                {src.label}
+                              </span>
                               {hasError && (
                                 <AlertTriangle className="h-3.5 w-3.5 text-destructive shrink-0" />
                               )}
@@ -924,11 +1165,17 @@ function SettingsPanel({
                           className="w-full rounded-md border border-border bg-muted/40 px-3 py-2.5 text-sm font-mono focus:outline-none focus:border-ring"
                         />
                         <div className="flex items-center gap-2 flex-wrap">
-                          <label className="text-[11px] font-mono text-muted-foreground">color</label>
+                          <label className="text-[11px] font-mono text-muted-foreground">
+                            color
+                          </label>
                           <div className="flex gap-1.5">
                             {[
-                              "oklch(0.7 0.18 200)", "oklch(0.7 0.2 50)", "oklch(0.65 0.22 25)",
-                              "oklch(0.7 0.2 320)", "oklch(0.75 0.2 140)", "oklch(0.85 0.005 250)",
+                              "oklch(0.7 0.18 200)",
+                              "oklch(0.7 0.2 50)",
+                              "oklch(0.65 0.22 25)",
+                              "oklch(0.7 0.2 320)",
+                              "oklch(0.75 0.2 140)",
+                              "oklch(0.85 0.005 250)",
                             ].map((c) => (
                               <button
                                 key={c}

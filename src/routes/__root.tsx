@@ -78,18 +78,30 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
       { title: "Real-time Chronicle" },
-      { name: "description", content: "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed." },
+      {
+        name: "description",
+        content:
+          "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed.",
+      },
       { name: "author", content: "Lovable" },
       { name: "theme-color", content: "#0a0e1a" },
       { name: "apple-mobile-web-app-capable", content: "yes" },
       { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" },
       { name: "apple-mobile-web-app-title", content: "Chronicle" },
       { property: "og:title", content: "Real-time Chronicle" },
-      { property: "og:description", content: "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed." },
+      {
+        property: "og:description",
+        content:
+          "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
       { name: "twitter:title", content: "Real-time Chronicle" },
-      { name: "twitter:description", content: "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed." },
+      {
+        name: "twitter:description",
+        content:
+          "Real-time terminal-style news aggregator displaying articles from multiple sources in a chronological, live feed.",
+      },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
