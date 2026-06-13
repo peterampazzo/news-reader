@@ -22,17 +22,6 @@ resource "cloudflare_pages_project" "news_reader" {
 }
 
 # ---------------------------------------------------------------------------
-# Custom domain — attach news.peterampazzo.com to the Pages project so that
-# Cloudflare recognises it as a valid Access domain (pages.dev alone won't work).
-# ---------------------------------------------------------------------------
-
-resource "cloudflare_pages_domain" "custom" {
-  account_id   = var.cloudflare_account_id
-  project_name = cloudflare_pages_project.news_reader.name
-  name         = local.app_domain
-}
-
-# ---------------------------------------------------------------------------
 # Zero Trust Access — protect /api/fetch-rss on the Pages hostname only.
 # ---------------------------------------------------------------------------
 
@@ -55,5 +44,5 @@ resource "cloudflare_zero_trust_access_application" "fetch_rss" {
     ]
   }]
 
-  depends_on = [cloudflare_pages_domain.custom]
+  depends_on = [cloudflare_pages_project.news_reader]
 }
