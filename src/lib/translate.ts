@@ -24,11 +24,7 @@ function saveToSession(key: string, value: string) {
   }
 }
 
-export async function translateText(
-  text: string,
-  from: string,
-  to: string,
-): Promise<string> {
+export async function translateText(text: string, from: string, to: string): Promise<string> {
   if (!text || !text.trim() || from === to) return text;
   const key = cacheKey(text, from, to);
   if (MEM_CACHE.has(key)) return MEM_CACHE.get(key)!;

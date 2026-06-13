@@ -1,6 +1,7 @@
 import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
+import { handleFetchRss } from "./lib/fetch-rss.server";
 import { renderErrorPage } from "./lib/error-page";
 
 type ServerEntry = {
@@ -40,6 +41,11 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
+      const { pathname } = new URL(request.url);
+      if (pathname === "/api/fetch-rss") {
+        return handleFetchRss(request);
+      }
+
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return await normalizeCatastrophicSsrResponse(response);
