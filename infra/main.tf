@@ -4,10 +4,10 @@
 # ---------------------------------------------------------------------------
 
 resource "cloudflare_worker_domain" "app" {
-  account_id  = var.cloudflare_account_id
-  zone_id     = var.cloudflare_zone_id
-  hostname    = local.app_domain
-  service     = var.project_name
+  account_id = var.cloudflare_account_id
+  zone_id    = var.cloudflare_zone_id
+  hostname   = local.app_domain
+  service    = var.project_name
 }
 
 # ---------------------------------------------------------------------------
