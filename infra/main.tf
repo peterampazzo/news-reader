@@ -22,16 +22,14 @@ resource "cloudflare_pages_project" "news_reader" {
 }
 
 # ---------------------------------------------------------------------------
-# Zero Trust Access — protect /api/fetch-rss on the Pages hostname only.
+# Zero Trust Access — protect the entire app.
 # ---------------------------------------------------------------------------
 
 resource "cloudflare_zero_trust_access_application" "fetch_rss" {
   account_id = var.cloudflare_account_id
-  name       = "${var.project_name}-fetch-rss"
-  domain     = "${local.app_domain}/api/fetch-rss"
+  name       = var.project_name
+  domain     = local.app_domain
   type       = "self_hosted"
-
-  path_cookie_attribute = true
 
   policies = [{
     name       = "Allow authorized email domains"
