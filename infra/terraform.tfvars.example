@@ -2,5 +2,5 @@ cloudflare_account_id = "your-cloudflare-account-id"
 # cloudflare_zone_id    = "optional-zone-id"
 project_name          = "news-reader"
 production_branch     = "main"
-# app_domain defaults to "<project_name>.pages.dev" when omitted
+app_domain            = "news.peterampazzo.com"
 allowed_email_domains = ["rampazzo.eu"]
